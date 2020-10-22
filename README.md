@@ -119,17 +119,12 @@
 분석/설계 단계에서 도출된 헥사고날 아키텍처에 따라, 각 BC별로 대변되는 마이크로 서비스들을 스프링부트로 구현하였다. 구현한 각 서비스를 로컬에서 실행하는 방법은 아래와 같다 (각자의 포트넘버는 8081 ~ 808n 이다)
 
 ```
-cd member
-mvn spring-boot:run
-
-cd message
-mvn spring-boot:run 
-
 cd point
 mvn spring-boot:run  
 
-cd mypage
-mvn spring-boot:run 
+cd refund
+mvn spring-boot:run
+
 ```
 
 ## DDD 의 적용
@@ -144,16 +139,16 @@ import org.springframework.beans.BeanUtils;
 import java.util.List;
 
 @Entity
-@Table(name="Member_table")
-public class Member {
+@Table(name="Refund_table")
+public class Refund {
 
     @Id
     @GeneratedValue(strategy=GenerationType.AUTO)
     private Long id;
     private Long memberId;
-    private String phoneNo;
-    private String nickname;
+    private Long remainPoint;
     private String memberStatus;
+    private Long refundPoint;
 
 
     public Long getId() {
@@ -170,19 +165,12 @@ public class Member {
     public void setMemberId(Long memberId) {
         this.memberId = memberId;
     }
-    public String getPhoneNo() {
-        return phoneNo;
+    public Long getRemainPoint() {
+        return remainPoint;
     }
 
-    public void setPhoneNo(String phoneNo) {
-        this.phoneNo = phoneNo;
-    }
-    public String getNickname() {
-        return nickname;
-    }
-
-    public void setNickname(String nickname) {
-        this.nickname = nickname;
+    public void setRemainPoint(Long remainPoint) {
+        this.remainPoint = remainPoint;
     }
     public String getMemberStatus() {
         return memberStatus;
@@ -191,6 +179,14 @@ public class Member {
     public void setMemberStatus(String memberStatus) {
         this.memberStatus = memberStatus;
     }
+    public Long getRefundPoint() {
+        return refundPoint;
+    }
+
+    public void setRefundPoint(Long refundPoint) {
+        this.refundPoint = refundPoint;
+    }
+
 }
 
 
@@ -202,21 +198,22 @@ package mileage;
 import org.springframework.data.repository.PagingAndSortingRepository;
 import java.util.Optional;
 
-public interface MessageRepository extends PagingAndSortingRepository<Message, Long>{
-    Optional<Message> findByMemberId(Long memberId);
+public interface RefundRepository extends PagingAndSortingRepository<Refund, Long>{
+    Optional<Refund> findByMemberId(Long memberId);
+
 
 }
 ```
 - 적용 후 REST API 의 테스트
 ```
-# member 신규 가입
-http POST http://localhost:8081/members phoneNo=01012341234 nickname=TEST memberStatus=READY memberId=99
+# point 신규 가입
+http POST http://localhost:8083/points memberId=1 memberStatus=NORMAL refundPoint=0
 
-# member 회원 탈퇴처리
-http DELETE http://localhost:8081/members/2
+# point 환급 요청
+http PATCH http://localhost:8083/points/1 refundPoint=100
 
-# point 정보 확인
-http GET http://localhost:8083/points/1 
+# point 환급 정보 확인
+http GET http://localhost:8085/refunds/1
 
 ```
 
@@ -296,62 +293,76 @@ public interface MessageRepository extends PagingAndSortingRepository<Message, L
 
 ## 동기식 호출 과 Fallback 처리
 
-분석단계에서의 조건 중 하나로 회원 탈퇴(member)-> 포인트 소멸(point) 간의 호출은 동기식 일관성을 유지하는 트랜잭션으로 처리하기로 하였다. 호출 프로토콜은 이미 앞서 Rest Repository 에 의해 노출되어있는 REST 서비스를 FeignClient 를 이용하여 호출하도록 한다. 
+분석단계에서의 조건 중 하나로 환급 취소 신청(point)-> 환급 취소 완료(refund) 간의 호출은 동기식 일관성을 유지하는 트랜잭션으로 처리하기로 하였다. 호출 프로토콜은 이미 앞서 Rest Repository 에 의해 노출되어있는 REST 서비스를 FeignClient 를 이용하여 호출하도록 한다. 
 
-- 포인트서비스를 호출하기 위하여 Stub과 (FeignClient) 를 이용하여 Service 대행 인터페이스 (Proxy) 를 구현 
+- 환급서비스를 호출하기 위하여 Stub과 (FeignClient) 를 이용하여 Service 대행 인터페이스 (Proxy) 를 구현 
 
 ```
-# (member) PointService.java
+# (point) RefundService.java
 
 package mileage.external;
 
-@FeignClient(name="point", url="${api.point.url}")
-public interface PointService {
+@FeignClient(name="refund", url="${api.refund.url}")
+public interface RefundService {
 
-    @RequestMapping(method= RequestMethod.DELETE, path="/points/{id}")
-    public void forfeit(@RequestBody Point point, @PathVariable Long id);
+    @RequestMapping(method= RequestMethod.POST, path="/refunds")
+    public void forfeit(@RequestBody Refund refund);
 
 }
 ```
 
-- 회원 탈퇴를 받은 직후(@PreRemove) 포인트를 요청하도록 처리
+- 환급 취소 신청을 받은 직후(@PreUpdate) 환급 시스템을 요청하도록 처리
 ```
-# Member.java (Entity)
+# Point.java (Entity)
 
-    @PreRemove
-    public void onPreRemove(){
-        MemberWithdrawn memberWithdrawn = new MemberWithdrawn();
-        BeanUtils.copyProperties(this, memberWithdrawn);
-        memberWithdrawn.setMemberStatus("WITHDRAWAL");
-        memberWithdrawn.publishAfterCommit();
+        @PreUpdate
+        public void onPreUpdate() {
 
-        mileage.external.Point point = new mileage.external.Point();
+                if(this.refundPoint < 0) {
+                        
+                        System.out.println("\n$$$onPostPersist" + this.refundPoint);
+                        
+                        RefundCancelled refundCancelled = new RefundCancelled();
+                        BeanUtils.copyProperties(this, refundCancelled);
+                        //refundCancelled.setMemberStatus("WITHDRAWAL");
+                        refundCancelled.publishAfterCommit();
 
-        point.setMemberId(this.getMemberId());
-        point.setMemberStatus("WITHDRAWAL");
+                        //Following code causes dependency to external APIs
+                        // it is NOT A GOOD PRACTICE. instead, Event-Policy mapping is recommended.
+                        mileage.external.Refund refund = new mileage.external.Refund();
+                        // mappings goes here
 
-        MemberApplication.applicationContext.getBean(mileage.external.PointService.class).forfeit(point, id);
-    }
+                        refund.setMemberId(this.getMemberId());
+                        refund.setRemainPoint(this.getRemainPoint());
+                        refund.setMemberStatus(this.getMemberStatus());
+                        refund.setRefundPoint(this.getRefundPoint());
+
+                        System.out.println("\ngetMemberId" + this.getMemberId());
+
+                        PointApplication.applicationContext.getBean(mileage.external.RefundService.class).forfeit(refund);
+
+                }
+        }
 ```
 
 - 동기식 호출에서는 호출 시간에 따른 타임 커플링이 발생하며, 포인트 시스템이 장애가 나면 포인트 소멸도 못받는다는 것을 확인:
 
 
 ```
-# 포인트 (point) 서비스를 잠시 내려놓음 (ctrl+c)
+# 환급 (refund) 서비스를 잠시 내려놓음 (ctrl+c)
 
-#탈퇴처리
-http DELETE http://localhost:8081/members/1   #Fail
-http DELETE http://localhost:8081/members/2   #Fail
+#환급 취소 신청
+http PATCH http://localhost:8083/points/1 refundPoint=-100   #Fail
+http PATCH http://localhost:8083/points/2 refundPoint=-200   #Fail
 
 
 #포인트서비스 재기동
-cd point
+cd refund
 mvn spring-boot:run
 
-#탈퇴처리
-http DELETE http://localhost:8081/members/1   #Success
-http DELETE http://localhost:8081/members/2   #Success
+#환급 취소 신청
+http PATCH http://localhost:8083/points/1 refundPoint=-100   #Success
+http PATCH http://localhost:8083/points/2 refundPoint=-200   #Success
 ```
 
 - 또한 과도한 요청시에 서비스 장애가 도미노 처럼 벌어질 수 있다. (서킷브레이커, 폴백 처리는 운영단계에서 설명한다.)
@@ -362,31 +373,38 @@ http DELETE http://localhost:8081/members/2   #Success
 ## 비동기식 호출 / 시간적 디커플링 / 장애격리 / 최종 (Eventual) 일관성 테스트
 
 
-회원가입이 이루어진 후에 메시지시스템으로 이를 알려주는 행위는 동기식이 아니라 비 동기식으로 처리하여 메시지 시스템의 처리를 위하여 회원가입이 블로킹 되지 않도록 처리한다.
+환급신청이 이루어진 후에 환급 시스템으로 이를 알려주는 행위는 동기식이 아니라 비 동기식으로 처리하여 메시지 시스템의 처리를 위하여 환급신청이 블로킹 되지 않도록 처리한다.
  
-- 이를 위하여 회원가입 기록을 남긴 후에 곧바로 회원가입이 되었다는 도메인 이벤트를 카프카로 송출한다(Publish)
+- 이를 위하여 환급신청 기록을 남긴 후에 곧바로 환급신청이 되었다는 도메인 이벤트를 카프카로 송출한다(Publish)
  
 ```
 package mileage;
 
 @Entity
-@Table(name="Member_table")
-public class Member {
+@Table(name="Point_table")
+public class Point {
 
  ...
-    @PostPersist
-    public void onPostPersist(){
-        MemberJoined memberJoined = new MemberJoined();
-        BeanUtils.copyProperties(this, memberJoined);
+        @PostUpdate
+        public void onPostUpdate(){
 
-        memberJoined.setMemberStatus("READY");
-        memberJoined.publishAfterCommit();
+                System.out.println("remainPoint : " + this.remainPoint);
+                System.out.println("refundPoint : " + this.refundPoint);
 
-    }
+                if(this.refundPoint > 0) {
+
+                        RefundApplied refundApplied = new RefundApplied();
+                        BeanUtils.copyProperties(this, refundApplied);
+                        refundApplied.publishAfterCommit();
+
+                }
+
+
+        }
 
 }
 ```
-- 메시지 서비스에서는 회원가입 이벤트에 대해서 이를 수신하여 자신의 정책을 처리하도록 PolicyHandler 를 구현한다:
+- 환급 서비스에서는 환급신청 이벤트에 대해서 이를 수신하여 자신의 정책을 처리하도록 PolicyHandler 를 구현한다:
 
 ```
 package mileage;
@@ -397,57 +415,60 @@ package mileage;
 public class PolicyHandler{
 
     @StreamListener(KafkaProcessor.INPUT)
-    public void wheneverMemberJoined_SendMsg(@Payload MemberJoined memberJoined) {
-    
-        if (memberJoined.isMe() && Objects.equals(memberJoined.getMemberStatus(), "READY")) {
-            
-            System.out.println("##### listener SendMsg : " + memberJoined.toJson());
-            // 회원 가입 정보를 받았으니, 메시지 전송을 슬슬 시작해야지..
-        }
-    }    
-    
+    public void wheneverRefundApplied_RefundProcess(@Payload RefundApplied refundApplied){
 
-}
+        if(refundApplied.isMe()){
+            System.out.println("##### listener RefundProcess : " + refundApplied.toJson());
+            //환급 신청 정보를 받았으니, 환급 처리를 슬슬 시작해야지..
 
-```
-실제 구현을 하자면, 회원가입 노티를 받고, 메시지 전송 후 정상 여부를 전달할테니, 우선 회원가입 정보를 DB에 받아놓은 후, 이후 처리는 해당 Aggregate 내에서 하면 되겠다.:
-  
-```
-  @Autowired MessageRepository messageRepository;  
-  
-  @StreamListener(KafkaProcessor.INPUT)
-    public void wheneverMemberJoined_SendMsg(@Payload MemberJoined memberJoined) {
-        if (memberJoined.isMe() && Objects.equals(memberJoined.getMemberStatus(), "READY")) {
-            Message message = new Message();
-
-            message.setMemberId(memberJoined.getMemberId());
-            message.setPhoneNo(memberJoined.getPhoneNo());
-            message.setMessageContents("CONTENTS");
-            message.setMessageStatus("READY");
-
-            messageRepository.save(message);
         }
     }
 
+}
+
+
+```
+실제 구현을 하자면, 환급신청 노티를 받고, 환급 처리 후 정상 여부를 전달할테니, 우선 환급신청 정보를 DB에 받아놓은 후, 이후 처리는 해당 Aggregate 내에서 하면 되겠다.:
+  
+```
+    @Autowired RefundRepository refundRepository;  
+  
+    @StreamListener(KafkaProcessor.INPUT)
+    public void wheneverRefundApplied_RefundProcess(@Payload RefundApplied refundApplied){
+
+        if(refundApplied.isMe()){
+            System.out.println("##### listener RefundProcess : " + refundApplied.toJson());
+
+            Refund refund = new Refund();
+
+            refund.setMemberId(refundApplied.getMemberId());
+            refund.setRemainPoint(refundApplied.getRemainPoint());
+            refund.setMemberStatus(refundApplied.getMemberStatus());
+            refund.setRefundPoint(refundApplied.getRefundPoint());
+
+            refundRepository.save(refund);
+
+        }
+    }
 ```
 
-메시지 시스템은 회원가입과 완전히 분리되어있으며, 이벤트 수신에 따라 처리되기 때문에, 메시지 시스템이 유지보수로 인해 잠시 내려간 상태라도 회원가입을 받는데 문제가 없다:
+환급 시스템은 환급신청과 완전히 분리되어있으며, 이벤트 수신에 따라 처리되기 때문에, 환급 시스템이 유지보수로 인해 잠시 내려간 상태라도 회원가입을 받는데 문제가 없다:
 ```
-# 메시지 서비스 (message)를 잠시 내려놓음 (ctrl+c)
+# 환급 서비스 (refund)를 잠시 내려놓음 (ctrl+c)
 
-#회원가입 처리
-http POST http://localhost:8081/members phoneNo=01012341234 nickname=TEST memberStatus=READY memberId=99   #Success
-http POST http://localhost:8081/members phoneNo=01056785678 nickname=TEST1 memberStatus=READY memberId=100 #Success
+#환급신청
+http PATCH http://localhost:8083/points/1 refundPoint=100 #Success
+http PATCH http://localhost:8083/points/2 refundPoint=200 #Success
 
 #회원가입 상태 확인
-http http://localhost:8081/members     # 회원 상태 안바뀜 확인
+http http://localhost:8083/points     # 잔여 포인트 안바뀜 확인
 
 #메시지 서비스 기동
-cd message
+cd refund
 mvn spring-boot:run
 
 #회원가입 상태 확인
-http http://localhost:8081/members     # 회원의 상태가 "NORMAL"로 확인
+http http://localhost:8083/points     # 환급 포인트만큼 잔여 포인트 차감됨 확인
 ```
 
 
